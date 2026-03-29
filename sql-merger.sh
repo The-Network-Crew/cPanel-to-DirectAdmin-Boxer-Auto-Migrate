@@ -9,7 +9,7 @@
 # Interactive: presents each database for naming before any changes.
 # Generates credentials and writes them to a summary file at the end.
 
-SQL_MERGER_VERSION="2026-03-30.6"
+SQL_MERGER_VERSION="2026-03-30.7"
 
 trap '__sm_rc=$?; echo "[FATAL] sql-merger died at line ${LINENO} (exit code ${__sm_rc})" >&2; echo "[FATAL] sql-merger died at line ${LINENO} (exit code ${__sm_rc})"; exit ${__sm_rc}' ERR
 
@@ -677,14 +677,33 @@ execute_single_db() {
 		api_resp=$(create_da_database "$da_user" "$db_suffix" "$dbuser_suffix" "$password" 2>&1)
 
 		if [[ "$api_resp" != *"error=0"* ]]; then
-			# Log the full response for debugging
-			echo "$api_resp" >> "$LOG_FILE"
-			P_STATUS[$idx]="FAIL"
-			P_NOTES[$idx]="DA API create failed: $(echo "$api_resp" | tr '&' ' ' | head -c 200)"
-			warn "DA API failed for ${dst_db}: ${api_resp}"
-			return 1
+			# If the user already exists, delete it and retry once
+			if [[ "$api_resp" == *"user+already+exists"* ]] || [[ "$api_resp" == *"user already exists"* ]]; then
+				warn "DB user '${dst_dbuser}' already exists — deleting stale user and retrying"
+				local del_resp
+				del_resp=$(da_api_as_user "$da_user" "CMD_API_DATABASES" \
+					-d "action=delete&select0=${dst_db}" 2>&1) || true
+				log "DA API delete response: $(echo "$del_resp" | tr '&' ' ' | head -c 200)"
+				api_resp=$(create_da_database "$da_user" "$db_suffix" "$dbuser_suffix" "$password" 2>&1)
+				if [[ "$api_resp" != *"error=0"* ]]; then
+					echo "$api_resp" >> "$LOG_FILE"
+					P_STATUS[$idx]="FAIL"
+					P_NOTES[$idx]="DA API create failed after retry: $(echo "$api_resp" | tr '&' ' ' | head -c 200)"
+					warn "DA API failed for ${dst_db} after retry: ${api_resp}"
+					return 1
+				fi
+				log "DA API: database + user created (after stale user cleanup)"
+			else
+				# Log the full response for debugging
+				echo "$api_resp" >> "$LOG_FILE"
+				P_STATUS[$idx]="FAIL"
+				P_NOTES[$idx]="DA API create failed: $(echo "$api_resp" | tr '&' ' ' | head -c 200)"
+				warn "DA API failed for ${dst_db}: ${api_resp}"
+				return 1
+			fi
+		else
+			log "DA API: database + user created"
 		fi
-		log "DA API: database + user created"
 	fi
 	step_elapsed=$(( SECONDS - step_start ))
 	log "[STATS] DA create complete — elapsed: $(fmt_elapsed "$step_elapsed")"
@@ -1077,12 +1096,10 @@ main() {
 
 	local run_start=$SECONDS
 	local failed=0
+	local rc=0
 
 	for (( i=0; i<${#P_DOMAIN[@]}; i++ )); do
-		set +e
-		execute_single_db "$i"
-		local rc=$?
-		set -e
+		execute_single_db "$i" && rc=0 || rc=$?
 		if [ "$rc" -ne 0 ]; then failed=$((failed + 1)); fi
 	done
 
